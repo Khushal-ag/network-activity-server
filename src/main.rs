@@ -68,16 +68,66 @@ async fn main() -> std::io::Result<()> {
     let db_path = "/home/ubuntu/sync_cron_job/kv_store";
 
     info!("Opening database at path: {}", db_path);
-    let db = match sled::open(db_path) {
-        Ok(db) => {
-            info!("Successfully opened database at {}", db_path);
-            db
+    
+    // Retry logic for database lock (cron job might be writing)
+    const MAX_RETRIES: u32 = 5;
+    const INITIAL_DELAY_MS: u64 = 500;
+    
+    let mut db = None;
+    let mut last_error = None;
+    
+    for attempt in 0..MAX_RETRIES {
+        match sled::open(&db_path) {
+            Ok(database) => {
+                info!("Successfully opened database at {} (attempt {})", db_path, attempt + 1);
+                db = Some(database);
+                break;
+            }
+            Err(e) => {
+                let error_msg = format!("{}", e);
+                let is_lock_error = error_msg.contains("lock") || 
+                                   error_msg.contains("WouldBlock") ||
+                                   error_msg.contains("Resource temporarily unavailable");
+                
+                if is_lock_error && attempt < MAX_RETRIES - 1 {
+                    let delay_ms = INITIAL_DELAY_MS * (1 << attempt); // Exponential backoff
+                    warn!("Database locked (attempt {}), retrying in {}ms...", attempt + 1, delay_ms);
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    last_error = Some(e);
+                } else {
+                    last_error = Some(e);
+                    break;
+                }
+            }
         }
-        Err(e) => {
-            error!("Failed to open sled database at {}: {}", db_path, e);
+    }
+    
+    let db = match db {
+        Some(database) => database,
+        None => {
+            let error = last_error.expect("Should have an error if db is None");
+            let error_msg = format!("{}", error);
+            let is_lock_error = error_msg.contains("lock") || 
+                               error_msg.contains("WouldBlock") ||
+                               error_msg.contains("Resource temporarily unavailable");
+            
+            if is_lock_error {
+                error!("Failed to open database after {} attempts. Database is locked.", MAX_RETRIES);
+                error!("This usually means:");
+                error!("  1. Another instance of the server is running");
+                error!("  2. The cron job is currently writing to the database");
+                error!("  3. The database was not properly closed");
+                error!("");
+                error!("Troubleshooting:");
+                error!("  - Check for other instances: ps aux | grep network_activity_server");
+                error!("  - Check if cron job is running: ps aux | grep sync_cron_job");
+                error!("  - Wait a few seconds and try again");
+            } else {
+                error!("Failed to open sled database at {}: {}", db_path, error);
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Database initialization failed: {}", e),
+                format!("Database initialization failed: {}", error),
             ));
         }
     };
