@@ -6,7 +6,7 @@ A RESTful API server that provides network activity data from a Sled database.
 
 ### Base URL
 ```
-http://localhost:8000
+http://localhost:8001
 ```
 
 ### Endpoints
