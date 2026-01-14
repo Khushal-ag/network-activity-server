@@ -146,7 +146,13 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    info!("🚀 Network Activity API starting on 0.0.0.0:8000");
+    // Get port from environment variable or default to 8001
+    let port = std::env::var("PORT")
+        .unwrap_or_else(|_| "8001".to_string())
+        .parse::<u16>()
+        .unwrap_or(8001);
+
+    info!("🚀 Network Activity API starting on 0.0.0.0:{}", port);
     info!("📂 Source DB path: {}", db_path);
     info!("📁 Temp copies directory: {:?}", temp_dir);
     info!("💡 Database will be copied to temp location on each API call to avoid locks");
@@ -162,7 +168,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(state.clone())
             .service(network_activity)
     })
-    .bind(("0.0.0.0", 8000))?
+    .bind(("0.0.0.0", port))?
     .run()
     .await
 }
