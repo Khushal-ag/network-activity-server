@@ -5,9 +5,41 @@ use log::{info, error, warn, debug};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChainTarget {
+    #[default]
+    #[serde(alias = "solana")]
+    Solana,
+    #[serde(alias = "base", alias = "evm")]
+    Base,
+}
+
+#[derive(Debug, Serialize)]
 pub struct TransactionResult {
     pub signatures: Vec<String>,
+    // Allow additional fields that might exist in the database
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for TransactionResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut map = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        
+        let signatures = map
+            .remove("signatures")
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+            .unwrap_or_default();
+        
+        Ok(TransactionResult {
+            signatures,
+            extra: map,
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -16,6 +48,40 @@ pub struct TransactionRecord {
     pub tx_result: TransactionResult,
     pub sent_at: DateTime<Utc>,
     pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UserKeyRecord {
+    pub id: String,
+    pub pubkey: String,
+    #[serde(skip_serializing)]
+    pub private_key: String, // Don't expose private keys in API
+    #[serde(default)]
+    pub chain: ChainTarget,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub last_used: Option<DateTime<Utc>>,
+    pub accumulated_credits: u128,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EnhancedTransactionRecord {
+    pub id: String,
+    pub tx_result: TransactionResult,
+    pub sent_at: DateTime<Utc>,
+    pub status: String,
+    pub chain: Option<ChainTarget>,
+    pub from_address: Option<String>,
+    pub user_key_info: Option<UserKeyInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserKeyInfo {
+    pub pubkey: String,
+    pub chain: ChainTarget,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub accumulated_credits: u128,
 }
 
 struct AppState {
@@ -38,16 +104,66 @@ fn copy_database(source: &str, dest: &PathBuf) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-fn read_from_database(db_path: &PathBuf) -> Result<Vec<TransactionRecord>, Box<dyn std::error::Error>> {
+fn read_from_database(db_path: &PathBuf) -> Result<(Vec<TransactionRecord>, Vec<UserKeyRecord>), Box<dyn std::error::Error>> {
     let db = sled::open(db_path)?;
     
+    // Read transactions
     let txs: Vec<TransactionRecord> = db
         .scan_prefix("tx:")
         .filter_map(|item| {
             match item {
                 Ok((_key, v)) => {
-                    match serde_json::from_slice::<TransactionRecord>(&v) {
-                        Ok(tx) => Some(tx),
+                    // Try to deserialize, but be flexible with TransactionResult
+                    match serde_json::from_slice::<serde_json::Value>(&v) {
+                        Ok(json_value) => {
+                            // Try to deserialize as TransactionRecord
+                            match serde_json::from_value::<TransactionRecord>(json_value.clone()) {
+                                Ok(tx) => Some(tx),
+                                Err(_) => {
+                                    // If that fails, try to construct manually
+                                    if let (Some(id), Some(tx_result), Some(sent_at), Some(status)) = (
+                                        json_value.get("id").and_then(|v| v.as_str()),
+                                        json_value.get("tx_result"),
+                                        json_value.get("sent_at").and_then(|v| {
+                                            serde_json::from_value::<DateTime<Utc>>(v.clone()).ok()
+                                        }),
+                                        json_value.get("status").and_then(|v| v.as_str()),
+                                    ) {
+                                        let signatures = tx_result
+                                            .get("signatures")
+                                            .and_then(|v| v.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        
+                                        let mut extra = serde_json::Map::new();
+                                        if let Some(obj) = tx_result.as_object() {
+                                            for (k, v) in obj {
+                                                if k != "signatures" {
+                                                    extra.insert(k.clone(), v.clone());
+                                                }
+                                            }
+                                        }
+                                        
+                                        Some(TransactionRecord {
+                                            id: id.to_string(),
+                                            tx_result: TransactionResult {
+                                                signatures,
+                                                extra,
+                                            },
+                                            sent_at,
+                                            status: status.to_string(),
+                                        })
+                                    } else {
+                                        warn!("Failed to parse transaction record structure");
+                                        None
+                                    }
+                                }
+                            }
+                        }
                         Err(e) => {
                             warn!("Failed to deserialize transaction record: {}", e);
                             None
@@ -62,14 +178,36 @@ fn read_from_database(db_path: &PathBuf) -> Result<Vec<TransactionRecord>, Box<d
         })
         .collect();
     
+    // Read user keys
+    let user_keys: Vec<UserKeyRecord> = db
+        .scan_prefix("user_key:")
+        .filter_map(|item| {
+            match item {
+                Ok((_key, v)) => {
+                    match serde_json::from_slice::<UserKeyRecord>(&v) {
+                        Ok(key) => Some(key),
+                        Err(e) => {
+                            debug!("Failed to deserialize user key record: {}", e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Error reading user key from database: {}", e);
+                    None
+                }
+            }
+        })
+        .collect();
+    
     // Close the database connection
     drop(db);
     
-    Ok(txs)
+    Ok((txs, user_keys))
 }
 
 #[get("/network-activity")]
-async fn network_activity(data: web::Data<AppState>) -> impl Responder {
+async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl Responder> {
     debug!("Fetching network activity from database");
     
     // Generate unique temp path for this request
@@ -85,11 +223,11 @@ async fn network_activity(data: web::Data<AppState>) -> impl Responder {
     
     if let Err(e) = copy_result {
         error!("Failed to copy database: {}", e);
-        return web::Json(Vec::<TransactionRecord>::new());
+        return Ok(web::Json(Vec::<EnhancedTransactionRecord>::new()));
     }
     
     // Read from copied database
-    let txs_result = read_from_database(&temp_db_path);
+    let db_result = read_from_database(&temp_db_path);
     
     // Clean up temp copy
     if temp_db_path.exists() {
@@ -100,24 +238,80 @@ async fn network_activity(data: web::Data<AppState>) -> impl Responder {
         }
     }
     
-    let mut txs = match txs_result {
-        Ok(transactions) => transactions,
+    let (mut txs, user_keys) = match db_result {
+        Ok((transactions, keys)) => (transactions, keys),
         Err(e) => {
             error!("Failed to read from database: {}", e);
-            return web::Json(Vec::<TransactionRecord>::new());
+            return Ok(web::Json(Vec::<EnhancedTransactionRecord>::new()));
         }
     };
 
-    info!("Found {} total transactions", txs.len());
+    info!("Found {} total transactions and {} user keys", txs.len(), user_keys.len());
     
     txs.sort_by(|a, b| b.sent_at.cmp(&a.sent_at));
 
-    let recent: Vec<TransactionRecord> = txs.into_iter().take(10).collect();
+    let recent = txs.into_iter().take(10);
     
-    info!("Returning {} recent transactions", recent.len());
-    debug!("Transaction IDs: {:?}", recent.iter().map(|t| &t.id).collect::<Vec<_>>());
+    // Enhance transactions with user key information
+    let enhanced: Vec<EnhancedTransactionRecord> = recent
+        .map(|tx| {
+            // Try to match transaction with user key by checking if any signature matches a user key
+            // or if we can infer chain from transaction data
+            let mut matched_key: Option<&UserKeyRecord> = None;
+            let mut inferred_chain: Option<ChainTarget> = None;
+            
+            // Check if any signature might match a user key pubkey
+            for sig in &tx.tx_result.signatures {
+                // Try to find matching user key
+                if let Some(key) = user_keys.iter().find(|k| k.pubkey == *sig || sig.contains(&k.pubkey)) {
+                    matched_key = Some(key);
+                    inferred_chain = Some(key.chain);
+                    break;
+                }
+            }
+            
+            // If no match found, try to infer chain from extra fields
+            if inferred_chain.is_none() {
+                if let Some(chain_str) = tx.tx_result.extra.get("chain")
+                    .and_then(|v| v.as_str())
+                {
+                    inferred_chain = match chain_str.to_lowercase().as_str() {
+                        "solana" => Some(ChainTarget::Solana),
+                        "base" | "evm" => Some(ChainTarget::Base),
+                        _ => None,
+                    };
+                }
+            }
+            
+            // Extract from_address if available
+            let from_address = tx.tx_result.extra
+                .get("from")
+                .or_else(|| tx.tx_result.extra.get("from_address"))
+                .or_else(|| tx.tx_result.extra.get("sender"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()));
+            
+            EnhancedTransactionRecord {
+                id: tx.id,
+                tx_result: tx.tx_result,
+                sent_at: tx.sent_at,
+                status: tx.status,
+                chain: inferred_chain,
+                from_address,
+                user_key_info: matched_key.map(|k| UserKeyInfo {
+                    pubkey: k.pubkey.clone(),
+                    chain: k.chain,
+                    created_at: k.created_at,
+                    expires_at: k.expires_at,
+                    accumulated_credits: k.accumulated_credits,
+                }),
+            }
+        })
+        .collect();
+    
+    info!("Returning {} enhanced transactions", enhanced.len());
+    debug!("Transaction IDs: {:?}", enhanced.iter().map(|t| &t.id).collect::<Vec<_>>());
 
-    web::Json(recent)
+    Ok(web::Json(enhanced))
 }
 
 #[actix_web::main]
