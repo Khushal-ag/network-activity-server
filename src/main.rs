@@ -1,8 +1,9 @@
 use actix_web::{get, web, App, HttpServer, Responder, middleware};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sled::Db;
 use log::{info, error, warn, debug};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TransactionResult {
@@ -18,14 +19,29 @@ pub struct TransactionRecord {
 }
 
 struct AppState {
-    db: Db,
+    db_path: String,
+    temp_dir: PathBuf,
 }
 
-#[get("/network-activity")]
-async fn network_activity(data: web::Data<AppState>) -> impl Responder {
-    debug!("Fetching network activity from database");
+fn copy_database(source: &str, dest: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    // Remove old copy if it exists
+    if dest.exists() {
+        fs_extra::dir::remove(dest)?;
+    }
     
-    let mut txs: Vec<TransactionRecord> = data.db
+    // Copy the entire database directory
+    let mut copy_options = fs_extra::dir::CopyOptions::new();
+    copy_options.overwrite = true;
+    copy_options.copy_inside = true;
+    
+    fs_extra::dir::copy(source, dest, &copy_options)?;
+    Ok(())
+}
+
+fn read_from_database(db_path: &PathBuf) -> Result<Vec<TransactionRecord>, Box<dyn std::error::Error>> {
+    let db = sled::open(db_path)?;
+    
+    let txs: Vec<TransactionRecord> = db
         .scan_prefix("tx:")
         .filter_map(|item| {
             match item {
@@ -45,6 +61,52 @@ async fn network_activity(data: web::Data<AppState>) -> impl Responder {
             }
         })
         .collect();
+    
+    // Close the database connection
+    drop(db);
+    
+    Ok(txs)
+}
+
+#[get("/network-activity")]
+async fn network_activity(data: web::Data<AppState>) -> impl Responder {
+    debug!("Fetching network activity from database");
+    
+    // Generate unique temp path for this request
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_db_path = data.temp_dir.join(format!("kv_store_{}", timestamp));
+    
+    // Copy database to temp location
+    debug!("Copying database from {} to temp location", data.db_path);
+    let copy_result = copy_database(&data.db_path, &temp_db_path);
+    
+    if let Err(e) = copy_result {
+        error!("Failed to copy database: {}", e);
+        return web::Json(Vec::<TransactionRecord>::new());
+    }
+    
+    // Read from copied database
+    let txs_result = read_from_database(&temp_db_path);
+    
+    // Clean up temp copy
+    if temp_db_path.exists() {
+        if let Err(e) = fs_extra::dir::remove(&temp_db_path) {
+            warn!("Failed to remove temp database copy: {}", e);
+        } else {
+            debug!("Cleaned up temp database copy");
+        }
+    }
+    
+    let mut txs = match txs_result {
+        Ok(transactions) => transactions,
+        Err(e) => {
+            error!("Failed to read from database: {}", e);
+            return web::Json(Vec::<TransactionRecord>::new());
+        }
+    };
 
     info!("Found {} total transactions", txs.len());
     
@@ -66,76 +128,33 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     let db_path = "/home/ubuntu/sync_cron_job/kv_store";
-
-    info!("Opening database at path: {}", db_path);
     
-    // Retry logic for database lock (cron job might be writing)
-    const MAX_RETRIES: u32 = 5;
-    const INITIAL_DELAY_MS: u64 = 500;
-    
-    let mut db = None;
-    let mut last_error = None;
-    
-    for attempt in 0..MAX_RETRIES {
-        match sled::open(&db_path) {
-            Ok(database) => {
-                info!("Successfully opened database at {} (attempt {})", db_path, attempt + 1);
-                db = Some(database);
-                break;
-            }
-            Err(e) => {
-                let error_msg = format!("{}", e);
-                let is_lock_error = error_msg.contains("lock") || 
-                                   error_msg.contains("WouldBlock") ||
-                                   error_msg.contains("Resource temporarily unavailable");
-                
-                if is_lock_error && attempt < MAX_RETRIES - 1 {
-                    let delay_ms = INITIAL_DELAY_MS * (1 << attempt); // Exponential backoff
-                    warn!("Database locked (attempt {}), retrying in {}ms...", attempt + 1, delay_ms);
-                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    last_error = Some(e);
-                } else {
-                    last_error = Some(e);
-                    break;
+    // Create temp directory for database copies
+    let temp_dir = std::env::temp_dir().join("network_activity_db_copies");
+    if !temp_dir.exists() {
+        std::fs::create_dir_all(&temp_dir)?;
+        info!("Created temp directory for database copies: {:?}", temp_dir);
+    } else {
+        // Clean up any old copies on startup
+        info!("Cleaning up old database copies from temp directory");
+        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+            for entry in entries.flatten() {
+                if let Err(e) = fs_extra::dir::remove(entry.path()) {
+                    warn!("Failed to remove old copy: {}", e);
                 }
             }
         }
     }
-    
-    let db = match db {
-        Some(database) => database,
-        None => {
-            let error = last_error.expect("Should have an error if db is None");
-            let error_msg = format!("{}", error);
-            let is_lock_error = error_msg.contains("lock") || 
-                               error_msg.contains("WouldBlock") ||
-                               error_msg.contains("Resource temporarily unavailable");
-            
-            if is_lock_error {
-                error!("Failed to open database after {} attempts. Database is locked.", MAX_RETRIES);
-                error!("This usually means:");
-                error!("  1. Another instance of the server is running");
-                error!("  2. The cron job is currently writing to the database");
-                error!("  3. The database was not properly closed");
-                error!("");
-                error!("Troubleshooting:");
-                error!("  - Check for other instances: ps aux | grep network_activity_server");
-                error!("  - Check if cron job is running: ps aux | grep sync_cron_job");
-                error!("  - Wait a few seconds and try again");
-            } else {
-                error!("Failed to open sled database at {}: {}", db_path, error);
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Database initialization failed: {}", error),
-            ));
-        }
-    };
 
     info!("🚀 Network Activity API starting on 0.0.0.0:8000");
-    info!("📂 Reading DB from {}", db_path);
+    info!("📂 Source DB path: {}", db_path);
+    info!("📁 Temp copies directory: {:?}", temp_dir);
+    info!("💡 Database will be copied to temp location on each API call to avoid locks");
 
-    let state = web::Data::new(AppState { db });
+    let state = web::Data::new(AppState {
+        db_path: db_path.to_string(),
+        temp_dir,
+    });
 
     HttpServer::new(move || {
         App::new()
