@@ -29,15 +29,16 @@ curl http://localhost:8000/network-activity
       "signatures": ["signature1", "signature2"]
     },
     "sent_at": "2024-01-01T12:00:00Z",
-    "status": "confirmed"
-  },
-  {
-    "id": "transaction_id_2",
-    "tx_result": {
-      "signatures": ["signature3"]
-    },
-    "sent_at": "2024-01-01T11:00:00Z",
-    "status": "pending"
+    "status": "confirmed",
+    "chain": "solana",
+    "from_address": "0x1234...",
+    "user_key_info": {
+      "pubkey": "0x5678...",
+      "chain": "solana",
+      "created_at": "2024-01-01T10:00:00Z",
+      "expires_at": "2024-01-02T10:00:00Z",
+      "accumulated_credits": 100
+    }
   }
 ]
 ```
@@ -46,8 +47,17 @@ curl http://localhost:8000/network-activity
 - `id` (string): Transaction identifier
 - `tx_result` (object): Transaction result containing:
   - `signatures` (array of strings): Transaction signatures
+  - Additional fields may be present in `tx_result` if they exist in the database
 - `sent_at` (string): ISO 8601 timestamp when transaction was sent
-- `status` (string): Transaction status
+- `status` (string): Transaction status (typically "confirmed")
+- `chain` (string, optional): Blockchain network - "solana" or "base"
+- `from_address` (string, optional): Sender address if available in transaction data
+- `user_key_info` (object, optional): Information about the user key used for this transaction:
+  - `pubkey` (string): Public key of the user
+  - `chain` (string): Blockchain network
+  - `created_at` (string): When the user key was created
+  - `expires_at` (string): When the user key expires
+  - `accumulated_credits` (number): Credits accumulated by this user key
 
 **Status Codes:**
 - `200 OK`: Successfully retrieved transactions
