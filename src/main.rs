@@ -317,7 +317,7 @@ async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl R
     
     if let Err(e) = copy_result {
         error!("Failed to copy database: {}", e);
-        return Ok(web::Json(Vec::<EnhancedTransactionRecord>::new()));
+        return Ok(web::Json(Vec::<FrontendActivityRecord>::new()));
     }
     
     // Read from copied database
@@ -336,7 +336,7 @@ async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl R
         Ok((transactions, keys)) => (transactions, keys),
         Err(e) => {
             error!("Failed to read from database: {}", e);
-            return Ok(web::Json(Vec::<EnhancedTransactionRecord>::new()));
+            return Ok(web::Json(Vec::<FrontendActivityRecord>::new()));
         }
     };
 
@@ -346,7 +346,7 @@ async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl R
 
     let recent = txs.into_iter().take(30);
     
-    // Enhance transactions with user key information
+    // First enhance transactions with user key information
     let enhanced: Vec<EnhancedTransactionRecord> = recent
         .map(|tx| {
             // Try to match transaction with user key by checking if any signature matches a user key
@@ -447,148 +447,7 @@ async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl R
         })
         .collect();
     
-    info!("Returning {} enhanced transactions", enhanced.len());
-    debug!("Transaction IDs: {:?}", enhanced.iter().map(|t| &t.id).collect::<Vec<_>>());
-
-    Ok(web::Json(enhanced))
-}
-
-#[get("/network-activity/frontend")]
-async fn network_activity_frontend(data: web::Data<AppState>) -> actix_web::Result<impl Responder> {
-    debug!("Fetching network activity for frontend");
-    
-    // Generate unique temp path for this request
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let temp_db_path = data.temp_dir.join(format!("kv_store_{}", timestamp));
-    
-    // Copy database to temp location
-    debug!("Copying database from {} to temp location", data.db_path);
-    let copy_result = copy_database(&data.db_path, &temp_db_path);
-    
-    if let Err(e) = copy_result {
-        error!("Failed to copy database: {}", e);
-        return Ok(web::Json(Vec::<FrontendActivityRecord>::new()));
-    }
-    
-    // Read from copied database
-    let db_result = read_from_database(&temp_db_path);
-    
-    // Clean up temp copy
-    if temp_db_path.exists() {
-        if let Err(e) = fs_extra::dir::remove(&temp_db_path) {
-            warn!("Failed to remove temp database copy: {}", e);
-        } else {
-            debug!("Cleaned up temp database copy");
-        }
-    }
-    
-    let (mut txs, user_keys) = match db_result {
-        Ok((transactions, keys)) => (transactions, keys),
-        Err(e) => {
-            error!("Failed to read from database: {}", e);
-            return Ok(web::Json(Vec::<FrontendActivityRecord>::new()));
-        }
-    };
-
-    info!("Found {} total transactions and {} user keys", txs.len(), user_keys.len());
-    
-    txs.sort_by(|a, b| b.sent_at.cmp(&a.sent_at));
-
-    let recent = txs.into_iter().take(30);
-    
-    // First enhance transactions (same logic as before)
-    let enhanced: Vec<EnhancedTransactionRecord> = recent
-        .map(|tx| {
-            let mut matched_key: Option<&UserKeyRecord> = None;
-            let mut inferred_chain: Option<ChainTarget> = None;
-            
-            // Infer chain from signature format
-            if inferred_chain.is_none() {
-                if let Some(first_sig) = tx.tx_result.signatures.first() {
-                    if first_sig.starts_with("0x") {
-                        inferred_chain = Some(ChainTarget::Base);
-                    } else if first_sig.len() > 40 && !first_sig.starts_with("0x") {
-                        inferred_chain = Some(ChainTarget::Solana);
-                    }
-                }
-            }
-            
-            // Check if any signature might match a user key pubkey
-            for sig in &tx.tx_result.signatures {
-                if let Some(key) = user_keys.iter().find(|k| {
-                    k.pubkey == *sig || 
-                    sig.contains(&k.pubkey) || 
-                    k.pubkey.contains(sig)
-                }) {
-                    matched_key = Some(key);
-                    if inferred_chain.is_none() {
-                        inferred_chain = Some(key.chain);
-                    }
-                    break;
-                }
-            }
-            
-            if inferred_chain.is_none() {
-                if let Some(chain_str) = tx.tx_result.extra.get("chain")
-                    .and_then(|v| v.as_str())
-                {
-                    inferred_chain = match chain_str.to_lowercase().as_str() {
-                        "solana" => Some(ChainTarget::Solana),
-                        "base" | "evm" => Some(ChainTarget::Base),
-                        _ => None,
-                    };
-                }
-            }
-            
-            let from_address = tx.tx_result.extra
-                .get("from")
-                .or_else(|| tx.tx_result.extra.get("from_address"))
-                .or_else(|| tx.tx_result.extra.get("sender"))
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
-                .or_else(|| {
-                    if inferred_chain == Some(ChainTarget::Base) {
-                        tx.tx_result.signatures.first()
-                            .and_then(|sig| {
-                                if sig.starts_with("0x") && sig.len() == 42 {
-                                    Some(sig.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                    } else {
-                        None
-                    }
-                });
-            
-            let transaction_purpose = tx.tx_result.extra
-                .get("ipfs_url")
-                .or_else(|| tx.tx_result.extra.get("purpose"))
-                .or_else(|| tx.tx_result.extra.get("description"))
-                .and_then(|v| v.as_str().map(|s| s.to_string()));
-            
-            EnhancedTransactionRecord {
-                id: tx.id,
-                tx_result: tx.tx_result,
-                sent_at: tx.sent_at,
-                status: tx.status,
-                chain: inferred_chain,
-                from_address,
-                user_key_info: matched_key.map(|k| UserKeyInfo {
-                    pubkey: k.pubkey.clone(),
-                    chain: k.chain,
-                    created_at: k.created_at,
-                    expires_at: k.expires_at,
-                    accumulated_credits: k.accumulated_credits,
-                }),
-                transaction_purpose,
-            }
-        })
-        .collect();
-    
-    // Transform to frontend format
+    // Transform to frontend-friendly format
     let frontend_records: Vec<FrontendActivityRecord> = enhanced
         .into_iter()
         .map(|tx| {
@@ -622,7 +481,8 @@ async fn network_activity_frontend(data: web::Data<AppState>) -> actix_web::Resu
         })
         .collect();
     
-    info!("Returning {} frontend-formatted transactions", frontend_records.len());
+    info!("Returning {} transactions", frontend_records.len());
+    debug!("Transaction IDs: {:?}", frontend_records.iter().map(|t| &t.id).collect::<Vec<_>>());
 
     Ok(web::Json(frontend_records))
 }
@@ -674,7 +534,6 @@ async fn main() -> std::io::Result<()> {
             .wrap(middleware::Logger::default())
             .app_data(state.clone())
             .service(network_activity)
-            .service(network_activity_frontend)
     })
     .bind(("0.0.0.0", port))?
     .run()
