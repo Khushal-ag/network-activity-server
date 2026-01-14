@@ -73,6 +73,100 @@ pub struct EnhancedTransactionRecord {
     pub chain: Option<ChainTarget>,
     pub from_address: Option<String>,
     pub user_key_info: Option<UserKeyInfo>,
+    pub transaction_purpose: Option<String>, // e.g., IPFS URL or description
+}
+
+// Frontend-friendly format
+#[derive(Debug, Serialize)]
+pub struct FrontendActivityRecord {
+    pub id: String,
+    pub user_address: String, // Truncated wallet address
+    pub action: String, // e.g., "uploaded healthcare dataset" or "earned 100 credits"
+    pub timestamp: String, // Relative time like "6D AGO"
+    pub credits: Option<u128>, // Credits earned if applicable
+    pub transaction_id: String, // Full transaction ID
+    pub sent_at: DateTime<Utc>, // For sorting
+}
+
+// Helper functions for frontend formatting
+fn truncate_address(address: &str) -> String {
+    if address.len() > 10 {
+        format!("{}...{}", &address[..6], &address[address.len()-4..])
+    } else {
+        address.to_string()
+    }
+}
+
+fn format_relative_time(dt: DateTime<Utc>) -> String {
+    let now = Utc::now();
+    let duration = now.signed_duration_since(dt);
+    
+    let days = duration.num_days();
+    let hours = duration.num_hours();
+    let minutes = duration.num_minutes();
+    
+    if days > 0 {
+        format!("{}D AGO", days)
+    } else if hours > 0 {
+        format!("{}H AGO", hours)
+    } else if minutes > 0 {
+        format!("{}M AGO", minutes)
+    } else {
+        "JUST NOW".to_string()
+    }
+}
+
+fn extract_action_description(tx: &EnhancedTransactionRecord) -> String {
+    // Check for credits earned first
+    if let Some(credits) = extract_credits(tx) {
+        if credits > 0 {
+            return format!("earned {} credits", credits);
+        }
+    }
+    
+    // Check for IPFS URL and extract dataset type
+    if let Some(ipfs_url) = &tx.transaction_purpose {
+        if ipfs_url.contains("ipfs") {
+            // Try to extract dataset type from transaction metadata
+            let dataset_type = tx.tx_result.extra
+                .get("dataset_type")
+                .or_else(|| tx.tx_result.extra.get("category"))
+                .or_else(|| tx.tx_result.extra.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("dataset");
+            
+            return format!("uploaded {} {}", dataset_type, "dataset");
+        }
+    }
+    
+    // Check if transaction has a description or purpose
+    if let Some(purpose) = &tx.transaction_purpose {
+        if !purpose.is_empty() && !purpose.contains("ipfs") {
+            return purpose.clone();
+        }
+    }
+    
+    // Default action - show user address if available
+    if let Some(from_addr) = &tx.from_address {
+        format!("{} sent transaction", truncate_address(from_addr))
+    } else if let Some(user_info) = &tx.user_key_info {
+        format!("{} sent transaction", truncate_address(&user_info.pubkey))
+    } else {
+        "transaction completed".to_string()
+    }
+}
+
+fn extract_credits(tx: &EnhancedTransactionRecord) -> Option<u128> {
+    // Try to get credits from various sources
+    tx.tx_result.extra
+        .get("user_accumulated_credits")
+        .and_then(|v| v.as_u64().map(|n| n as u128))
+        .or_else(|| {
+            tx.user_key_info
+                .as_ref()
+                .map(|info| info.accumulated_credits)
+                .filter(|&credits| credits > 0)
+        })
 }
 
 #[derive(Debug, Serialize)]
@@ -250,7 +344,7 @@ async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl R
     
     txs.sort_by(|a, b| b.sent_at.cmp(&a.sent_at));
 
-    let recent = txs.into_iter().take(20);
+    let recent = txs.into_iter().take(30);
     
     // Enhance transactions with user key information
     let enhanced: Vec<EnhancedTransactionRecord> = recent
@@ -260,12 +354,32 @@ async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl R
             let mut matched_key: Option<&UserKeyRecord> = None;
             let mut inferred_chain: Option<ChainTarget> = None;
             
+            // Infer chain from signature format
+            // Signatures starting with 0x are EVM/Base, base58 are Solana
+            if inferred_chain.is_none() {
+                if let Some(first_sig) = tx.tx_result.signatures.first() {
+                    if first_sig.starts_with("0x") {
+                        inferred_chain = Some(ChainTarget::Base);
+                    } else if first_sig.len() > 40 && !first_sig.starts_with("0x") {
+                        // Solana signatures are typically base58 encoded, longer and don't start with 0x
+                        inferred_chain = Some(ChainTarget::Solana);
+                    }
+                }
+            }
+            
             // Check if any signature might match a user key pubkey
             for sig in &tx.tx_result.signatures {
                 // Try to find matching user key
-                if let Some(key) = user_keys.iter().find(|k| k.pubkey == *sig || sig.contains(&k.pubkey)) {
+                if let Some(key) = user_keys.iter().find(|k| {
+                    k.pubkey == *sig || 
+                    sig.contains(&k.pubkey) || 
+                    k.pubkey.contains(sig)
+                }) {
                     matched_key = Some(key);
-                    inferred_chain = Some(key.chain);
+                    // Override inferred chain with user key's chain if we found a match
+                    if inferred_chain.is_none() {
+                        inferred_chain = Some(key.chain);
+                    }
                     break;
                 }
             }
@@ -284,10 +398,34 @@ async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl R
             }
             
             // Extract from_address if available
+            // For EVM transactions, the first signature might be the address
             let from_address = tx.tx_result.extra
                 .get("from")
                 .or_else(|| tx.tx_result.extra.get("from_address"))
                 .or_else(|| tx.tx_result.extra.get("sender"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .or_else(|| {
+                    // For Base/EVM, if we have a signature starting with 0x, it might be an address
+                    if inferred_chain == Some(ChainTarget::Base) {
+                        tx.tx_result.signatures.first()
+                            .and_then(|sig| {
+                                // Check if it looks like an address (0x followed by 40 hex chars)
+                                if sig.starts_with("0x") && sig.len() == 42 {
+                                    Some(sig.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                    } else {
+                        None
+                    }
+                });
+            
+            // Extract transaction purpose (e.g., IPFS URL)
+            let transaction_purpose = tx.tx_result.extra
+                .get("ipfs_url")
+                .or_else(|| tx.tx_result.extra.get("purpose"))
+                .or_else(|| tx.tx_result.extra.get("description"))
                 .and_then(|v| v.as_str().map(|s| s.to_string()));
             
             EnhancedTransactionRecord {
@@ -304,6 +442,7 @@ async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl R
                     expires_at: k.expires_at,
                     accumulated_credits: k.accumulated_credits,
                 }),
+                transaction_purpose,
             }
         })
         .collect();
@@ -312,6 +451,180 @@ async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl R
     debug!("Transaction IDs: {:?}", enhanced.iter().map(|t| &t.id).collect::<Vec<_>>());
 
     Ok(web::Json(enhanced))
+}
+
+#[get("/network-activity/frontend")]
+async fn network_activity_frontend(data: web::Data<AppState>) -> actix_web::Result<impl Responder> {
+    debug!("Fetching network activity for frontend");
+    
+    // Generate unique temp path for this request
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_db_path = data.temp_dir.join(format!("kv_store_{}", timestamp));
+    
+    // Copy database to temp location
+    debug!("Copying database from {} to temp location", data.db_path);
+    let copy_result = copy_database(&data.db_path, &temp_db_path);
+    
+    if let Err(e) = copy_result {
+        error!("Failed to copy database: {}", e);
+        return Ok(web::Json(Vec::<FrontendActivityRecord>::new()));
+    }
+    
+    // Read from copied database
+    let db_result = read_from_database(&temp_db_path);
+    
+    // Clean up temp copy
+    if temp_db_path.exists() {
+        if let Err(e) = fs_extra::dir::remove(&temp_db_path) {
+            warn!("Failed to remove temp database copy: {}", e);
+        } else {
+            debug!("Cleaned up temp database copy");
+        }
+    }
+    
+    let (mut txs, user_keys) = match db_result {
+        Ok((transactions, keys)) => (transactions, keys),
+        Err(e) => {
+            error!("Failed to read from database: {}", e);
+            return Ok(web::Json(Vec::<FrontendActivityRecord>::new()));
+        }
+    };
+
+    info!("Found {} total transactions and {} user keys", txs.len(), user_keys.len());
+    
+    txs.sort_by(|a, b| b.sent_at.cmp(&a.sent_at));
+
+    let recent = txs.into_iter().take(30);
+    
+    // First enhance transactions (same logic as before)
+    let enhanced: Vec<EnhancedTransactionRecord> = recent
+        .map(|tx| {
+            let mut matched_key: Option<&UserKeyRecord> = None;
+            let mut inferred_chain: Option<ChainTarget> = None;
+            
+            // Infer chain from signature format
+            if inferred_chain.is_none() {
+                if let Some(first_sig) = tx.tx_result.signatures.first() {
+                    if first_sig.starts_with("0x") {
+                        inferred_chain = Some(ChainTarget::Base);
+                    } else if first_sig.len() > 40 && !first_sig.starts_with("0x") {
+                        inferred_chain = Some(ChainTarget::Solana);
+                    }
+                }
+            }
+            
+            // Check if any signature might match a user key pubkey
+            for sig in &tx.tx_result.signatures {
+                if let Some(key) = user_keys.iter().find(|k| {
+                    k.pubkey == *sig || 
+                    sig.contains(&k.pubkey) || 
+                    k.pubkey.contains(sig)
+                }) {
+                    matched_key = Some(key);
+                    if inferred_chain.is_none() {
+                        inferred_chain = Some(key.chain);
+                    }
+                    break;
+                }
+            }
+            
+            if inferred_chain.is_none() {
+                if let Some(chain_str) = tx.tx_result.extra.get("chain")
+                    .and_then(|v| v.as_str())
+                {
+                    inferred_chain = match chain_str.to_lowercase().as_str() {
+                        "solana" => Some(ChainTarget::Solana),
+                        "base" | "evm" => Some(ChainTarget::Base),
+                        _ => None,
+                    };
+                }
+            }
+            
+            let from_address = tx.tx_result.extra
+                .get("from")
+                .or_else(|| tx.tx_result.extra.get("from_address"))
+                .or_else(|| tx.tx_result.extra.get("sender"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .or_else(|| {
+                    if inferred_chain == Some(ChainTarget::Base) {
+                        tx.tx_result.signatures.first()
+                            .and_then(|sig| {
+                                if sig.starts_with("0x") && sig.len() == 42 {
+                                    Some(sig.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                    } else {
+                        None
+                    }
+                });
+            
+            let transaction_purpose = tx.tx_result.extra
+                .get("ipfs_url")
+                .or_else(|| tx.tx_result.extra.get("purpose"))
+                .or_else(|| tx.tx_result.extra.get("description"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()));
+            
+            EnhancedTransactionRecord {
+                id: tx.id,
+                tx_result: tx.tx_result,
+                sent_at: tx.sent_at,
+                status: tx.status,
+                chain: inferred_chain,
+                from_address,
+                user_key_info: matched_key.map(|k| UserKeyInfo {
+                    pubkey: k.pubkey.clone(),
+                    chain: k.chain,
+                    created_at: k.created_at,
+                    expires_at: k.expires_at,
+                    accumulated_credits: k.accumulated_credits,
+                }),
+                transaction_purpose,
+            }
+        })
+        .collect();
+    
+    // Transform to frontend format
+    let frontend_records: Vec<FrontendActivityRecord> = enhanced
+        .into_iter()
+        .map(|tx| {
+            let user_address = tx.from_address
+                .as_ref()
+                .map(|addr| truncate_address(addr))
+                .or_else(|| {
+                    tx.user_key_info
+                        .as_ref()
+                        .map(|info| truncate_address(&info.pubkey))
+                })
+                .or_else(|| {
+                    tx.tx_result.signatures.first()
+                        .map(|sig| truncate_address(sig))
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            
+            let action = extract_action_description(&tx);
+            let credits = extract_credits(&tx);
+            let timestamp = format_relative_time(tx.sent_at);
+            
+            FrontendActivityRecord {
+                id: tx.id.clone(),
+                user_address,
+                action,
+                timestamp,
+                credits,
+                transaction_id: tx.id,
+                sent_at: tx.sent_at,
+            }
+        })
+        .collect();
+    
+    info!("Returning {} frontend-formatted transactions", frontend_records.len());
+
+    Ok(web::Json(frontend_records))
 }
 
 #[actix_web::main]
@@ -361,6 +674,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(middleware::Logger::default())
             .app_data(state.clone())
             .service(network_activity)
+            .service(network_activity_frontend)
     })
     .bind(("0.0.0.0", port))?
     .run()

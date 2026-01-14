@@ -13,7 +13,7 @@ http://localhost:8001
 
 #### GET `/network-activity`
 
-Returns the 20 most recent transactions from the database, sorted by timestamp (newest first).
+Returns the 30 most recent transactions from the database, sorted by timestamp (newest first).
 
 **Request:**
 ```bash
@@ -64,6 +64,6 @@ curl http://localhost:8000/network-activity
 - `500 Internal Server Error`: Database or server error
 
 **Notes:**
-- Returns up to 20 most recent transactions
+- Returns up to 30 most recent transactions
 - Transactions are sorted by `sent_at` in descending order (newest first)
 - Returns empty array `[]` if no transactions are found
