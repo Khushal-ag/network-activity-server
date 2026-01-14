@@ -250,7 +250,7 @@ async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl R
     
     txs.sort_by(|a, b| b.sent_at.cmp(&a.sent_at));
 
-    let recent = txs.into_iter().take(10);
+    let recent = txs.into_iter().take(20);
     
     // Enhance transactions with user key information
     let enhanced: Vec<EnhancedTransactionRecord> = recent
