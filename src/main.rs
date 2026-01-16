@@ -164,7 +164,7 @@ fn read_from_database(db_path: &PathBuf) -> Result<(Vec<TransactionRecord>, Vec<
     let txs: Vec<TransactionRecord> = db
         .scan_prefix("tx:")
         .filter_map(|item| {
-            item.ok().and_then(|(key, v)| {
+            item.ok().and_then(|(_key, v)| {
                 // Store raw JSON with transaction ID for later logging
                 if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&v) {
                     if let Some(id) = json_value.get("id").and_then(|v| v.as_str()) {
