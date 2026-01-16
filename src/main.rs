@@ -1,7 +1,7 @@
 use actix_web::{get, web, App, HttpServer, Responder, middleware};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use log::{info, error, debug};
+use log::{info, error, warn, debug};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -156,16 +156,28 @@ fn copy_database(source: &str, dest: &PathBuf) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-fn read_from_database(db_path: &PathBuf) -> Result<(Vec<TransactionRecord>, Vec<UserKeyRecord>), Box<dyn std::error::Error>> {
+fn read_from_database(db_path: &PathBuf) -> Result<(Vec<TransactionRecord>, Vec<UserKeyRecord>, Vec<(String, String)>), Box<dyn std::error::Error>> {
     let db = sled::open(db_path)?;
     
-    // Read transactions
+    // Read transactions with raw JSON data
+    let mut raw_tx_data = Vec::new();
     let txs: Vec<TransactionRecord> = db
         .scan_prefix("tx:")
         .filter_map(|item| {
-            item.ok()
-                .and_then(|(_, v)| serde_json::from_slice::<serde_json::Value>(&v).ok())
-                .and_then(|json| serde_json::from_value::<TransactionRecord>(json).ok())
+            item.ok().and_then(|(key, v)| {
+                // Store raw JSON with transaction ID for later logging
+                if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&v) {
+                    if let Some(id) = json_value.get("id").and_then(|v| v.as_str()) {
+                        if let Ok(json_str) = serde_json::to_string_pretty(&json_value) {
+                            raw_tx_data.push((id.to_string(), json_str));
+                        }
+                    }
+                    
+                    serde_json::from_value::<TransactionRecord>(json_value).ok()
+                } else {
+                    None
+                }
+            })
         })
         .collect();
     
@@ -174,12 +186,12 @@ fn read_from_database(db_path: &PathBuf) -> Result<(Vec<TransactionRecord>, Vec<
         .scan_prefix("user_key:")
         .filter_map(|item| {
             item.ok()
-                .and_then(|(_, v)| serde_json::from_slice::<UserKeyRecord>(&v).ok())
+                .and_then(|(_key, v)| serde_json::from_slice::<UserKeyRecord>(&v).ok())
         })
         .collect();
     
     drop(db);
-    Ok((txs, user_keys))
+    Ok((txs, user_keys, raw_tx_data))
 }
 
 fn enhance_transaction(tx: TransactionRecord, user_keys: &[UserKeyRecord]) -> FrontendActivityRecord {
@@ -242,7 +254,7 @@ async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl R
         return Ok(web::Json(Vec::<FrontendActivityRecord>::new()));
     }
     
-    let (mut txs, user_keys) = match read_from_database(&temp_db_path) {
+    let (mut txs, user_keys, raw_tx_data) = match read_from_database(&temp_db_path) {
         Ok(data) => data,
         Err(e) => {
             error!("Failed to read from database: {}", e);
@@ -257,8 +269,22 @@ async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl R
     
     info!("Found {} transactions and {} user keys", txs.len(), user_keys.len());
     
-    // Sort, take 30, and enhance
+    // Sort and take 30
     txs.sort_by(|a, b| b.sent_at.cmp(&a.sent_at));
+    let top_30_ids: Vec<String> = txs.iter().take(30).map(|tx| tx.id.clone()).collect();
+    
+    // Log raw database entries for the 30 transactions being returned
+    info!("=== Raw Database Entries for {} Transactions Being Returned ===", top_30_ids.len());
+    for (i, id) in top_30_ids.iter().enumerate() {
+        if let Some((_, raw_json)) = raw_tx_data.iter().find(|(tx_id, _)| tx_id == id) {
+            info!("--- Transaction {} (ID: {}) ---", i + 1, id);
+            info!("{}", raw_json);
+        } else {
+            warn!("Could not find raw data for transaction ID: {}", id);
+        }
+    }
+    
+    // Enhance and return
     let records: Vec<FrontendActivityRecord> = txs
         .into_iter()
         .take(30)
