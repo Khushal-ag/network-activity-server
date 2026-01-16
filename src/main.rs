@@ -124,10 +124,10 @@ fn find_matching_user_key<'a>(signatures: &[String], user_keys: &'a [UserKeyReco
 // Helper: Extract address from transaction
 fn extract_address(tx: &TransactionRecord, chain: Option<ChainTarget>, user_key: Option<&UserKeyRecord>) -> Option<String> {
     // Try from transaction extra fields
-    get_str_from_map(&tx.tx_result.extra, &["from", "from_address", "sender"])
+    get_str_from_map(&tx.tx_result.extra, &["from", "from_address", "sender", "wallet", "account"])
         // Try from user key
         .or_else(|| user_key.map(|k| k.pubkey.clone()))
-        // Try from signature if it looks like an address
+        // For Base/EVM: try signature if it looks like an address (42 chars = 0x + 40 hex)
         .or_else(|| {
             if chain == Some(ChainTarget::Base) {
                 tx.tx_result.signatures.first().and_then(|sig| {
@@ -141,6 +141,8 @@ fn extract_address(tx: &TransactionRecord, chain: Option<ChainTarget>, user_key:
                 None
             }
         })
+        // Fallback: use first signature as identifier (even if it's a transaction hash)
+        .or_else(|| tx.tx_result.signatures.first().cloned())
 }
 
 fn copy_database(source: &str, dest: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
