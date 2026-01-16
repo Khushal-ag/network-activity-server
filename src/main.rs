@@ -76,98 +76,22 @@ pub struct EnhancedTransactionRecord {
     pub transaction_purpose: Option<String>, // e.g., IPFS URL or description
 }
 
-// Frontend-friendly format
+// Simple frontend format - just raw transaction fields
 #[derive(Debug, Serialize)]
 pub struct FrontendActivityRecord {
     pub id: String,
-    pub user_address: String, // Truncated wallet address
-    pub action: String, // e.g., "uploaded healthcare dataset" or "earned 100 credits"
-    pub timestamp: String, // Relative time like "6D AGO"
-    pub credits: Option<u128>, // Credits earned if applicable
-    pub transaction_id: String, // Full transaction ID
-    pub sent_at: DateTime<Utc>, // For sorting
+    pub transaction_id: String,
+    pub user_address: Option<String>, // Full wallet address
+    pub signatures: Vec<String>,
+    pub sent_at: DateTime<Utc>,
+    pub status: String,
+    pub chain: Option<String>, // "solana" or "base"
+    pub ipfs_url: Option<String>,
+    pub credits: Option<u128>,
+    pub user_accumulated_credits: Option<u128>,
+    pub tx_result: serde_json::Value, // All other transaction result fields
 }
 
-// Helper functions for frontend formatting
-fn truncate_address(address: &str) -> String {
-    if address.len() > 10 {
-        format!("{}...{}", &address[..6], &address[address.len()-4..])
-    } else {
-        address.to_string()
-    }
-}
-
-fn format_relative_time(dt: DateTime<Utc>) -> String {
-    let now = Utc::now();
-    let duration = now.signed_duration_since(dt);
-    
-    let days = duration.num_days();
-    let hours = duration.num_hours();
-    let minutes = duration.num_minutes();
-    
-    if days > 0 {
-        format!("{}D AGO", days)
-    } else if hours > 0 {
-        format!("{}H AGO", hours)
-    } else if minutes > 0 {
-        format!("{}M AGO", minutes)
-    } else {
-        "JUST NOW".to_string()
-    }
-}
-
-fn extract_action_description(tx: &EnhancedTransactionRecord) -> String {
-    // Check for credits earned first
-    if let Some(credits) = extract_credits(tx) {
-        if credits > 0 {
-            return format!("earned {} credits", credits);
-        }
-    }
-    
-    // Check for IPFS URL and extract dataset type
-    if let Some(ipfs_url) = &tx.transaction_purpose {
-        if ipfs_url.contains("ipfs") {
-            // Try to extract dataset type from transaction metadata
-            let dataset_type = tx.tx_result.extra
-                .get("dataset_type")
-                .or_else(|| tx.tx_result.extra.get("category"))
-                .or_else(|| tx.tx_result.extra.get("type"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("dataset");
-            
-            return format!("uploaded {} {}", dataset_type, "dataset");
-        }
-    }
-    
-    // Check if transaction has a description or purpose
-    if let Some(purpose) = &tx.transaction_purpose {
-        if !purpose.is_empty() && !purpose.contains("ipfs") {
-            return purpose.clone();
-        }
-    }
-    
-    // Default action - show user address if available
-    if let Some(from_addr) = &tx.from_address {
-        format!("{} sent transaction", truncate_address(from_addr))
-    } else if let Some(user_info) = &tx.user_key_info {
-        format!("{} sent transaction", truncate_address(&user_info.pubkey))
-    } else {
-        "transaction completed".to_string()
-    }
-}
-
-fn extract_credits(tx: &EnhancedTransactionRecord) -> Option<u128> {
-    // Try to get credits from various sources
-    tx.tx_result.extra
-        .get("user_accumulated_credits")
-        .and_then(|v| v.as_u64().map(|n| n as u128))
-        .or_else(|| {
-            tx.user_key_info
-                .as_ref()
-                .map(|info| info.accumulated_credits)
-                .filter(|&credits| credits > 0)
-        })
-}
 
 #[derive(Debug, Serialize)]
 pub struct UserKeyInfo {
@@ -293,7 +217,7 @@ fn read_from_database(db_path: &PathBuf) -> Result<(Vec<TransactionRecord>, Vec<
             }
         })
         .collect();
-    
+
     // Close the database connection
     drop(db);
     
@@ -447,36 +371,65 @@ async fn network_activity(data: web::Data<AppState>) -> actix_web::Result<impl R
         })
         .collect();
     
-    // Transform to frontend-friendly format
+    // Transform to simple frontend format - just raw fields
     let frontend_records: Vec<FrontendActivityRecord> = enhanced
         .into_iter()
         .map(|tx| {
+            // Get user address from various sources
             let user_address = tx.from_address
-                .as_ref()
-                .map(|addr| truncate_address(addr))
+                .clone()
                 .or_else(|| {
                     tx.user_key_info
                         .as_ref()
-                        .map(|info| truncate_address(&info.pubkey))
+                        .map(|info| info.pubkey.clone())
                 })
                 .or_else(|| {
                     tx.tx_result.signatures.first()
-                        .map(|sig| truncate_address(sig))
-                })
-                .unwrap_or_else(|| "unknown".to_string());
+                        .cloned()
+                });
             
-            let action = extract_action_description(&tx);
-            let credits = extract_credits(&tx);
-            let timestamp = format_relative_time(tx.sent_at);
+            // Get credits from transaction data
+            let credits = tx.tx_result.extra
+                .get("credits")
+                .or_else(|| tx.tx_result.extra.get("reward"))
+                .or_else(|| tx.tx_result.extra.get("amount"))
+                .and_then(|v| v.as_u64().map(|n| n as u128))
+                .filter(|&credits| credits > 0);
+            
+            let user_accumulated_credits = tx.tx_result.extra
+                .get("user_accumulated_credits")
+                .and_then(|v| v.as_u64().map(|n| n as u128));
+            
+            // Get IPFS URL
+            let ipfs_url = tx.transaction_purpose
+                .clone()
+                .filter(|url| url.contains("ipfs"));
+            
+            // Convert chain to string
+            let chain = tx.chain.map(|c| match c {
+                ChainTarget::Solana => "solana".to_string(),
+                ChainTarget::Base => "base".to_string(),
+            });
+            
+            // Convert tx_result to JSON value for all extra fields
+            let mut tx_result_json = serde_json::Map::new();
+            tx_result_json.insert("signatures".to_string(), serde_json::to_value(&tx.tx_result.signatures).unwrap());
+            for (k, v) in tx.tx_result.extra {
+                tx_result_json.insert(k, v);
+            }
             
             FrontendActivityRecord {
                 id: tx.id.clone(),
-                user_address,
-                action,
-                timestamp,
-                credits,
                 transaction_id: tx.id,
+                user_address,
+                signatures: tx.tx_result.signatures,
                 sent_at: tx.sent_at,
+                status: tx.status,
+                chain,
+                ipfs_url,
+                credits,
+                user_accumulated_credits,
+                tx_result: serde_json::Value::Object(tx_result_json),
             }
         })
         .collect();
@@ -495,7 +448,7 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     let db_path = "/home/ubuntu/sync_cron_job/kv_store";
-    
+
     // Create temp directory for database copies
     let temp_dir = std::env::temp_dir().join("network_activity_db_copies");
     if !temp_dir.exists() {
